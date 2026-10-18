@@ -1159,7 +1159,7 @@ PRs welcome. Read [COMPASS.md](COMPASS.md) for architecture context and [DEPLOY.
 
 ```bash
 # Clone and build
-git clone https://github.com/sagelabs-dev/beam.git
+git clone https://github.com/retiform-labs/beam.git
 cd beam
 cargo build
 
@@ -1205,4 +1205,4 @@ If BEAM is useful to you, consider supporting its continued development:
 
 ---
 
-Crafted with ❤️ by [Sage Labs](https://sagelabs.dev)
+Crafted with ❤️ by [Retiform Labs](https://retiform.dev)
