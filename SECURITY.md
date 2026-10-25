@@ -14,7 +14,7 @@ responsibly:
 
 1. **Preferred:** Use GitHub's private vulnerability reporting feature
    (Security tab → "Report a vulnerability")
-2. **Alternative:** Email david.r.newman@proton.me
+2. **Alternative:** Email guan@retiform.dev
 
 Please do not open a public GitHub issue for security vulnerabilities.
 

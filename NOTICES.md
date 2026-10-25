@@ -21,7 +21,9 @@ Full contributor history is preserved in the git log of the upstream project.
 
 ## BEAM Project
 
-**Copyright (c) 2026 David Newman <david.r.newman@proton.me>**
+**Copyright (c) 2026 David Newman <david@retiform.dev>**
+
+**Copyright (c) 2026 Guan <guan@retiform.dev>**
 
 BEAM is maintained by **David Newman** (2026–present) as an actively developed successor to rod. Major additions over the upstream rod codebase include:
 

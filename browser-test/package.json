@@ -3,14 +3,14 @@
   "type": "module",
   "collaborators": [
     "Martti Malmi <martti@mmalmi.org>",
-    "David Newman <david.r.newman@proton.me>"
+    "David Newman & Guan <guan@retiform.dev>"
   ],
   "description": "BEAM — distributed graph database syncing over WebSocket, WebRTC, and multicast. Successor to rod.",
   "version": "0.9.1",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/sagelabs-dev/beam"
+    "url": "https://github.com/retiform-labs/beam"
   },
   "files": [
     "beam_bg.wasm",
@@ -18,7 +18,7 @@
     "beam.d.ts"
   ],
   "main": "beam.js",
-  "homepage": "https://github.com/sagelabs-dev/beam",
+  "homepage": "https://github.com/retiform-labs/beam",
   "types": "beam.d.ts",
   "sideEffects": [
     "./snippets/*"

@@ -887,7 +887,7 @@ quorum-ack, send-metrics). v0.8.0 makes that independence explicit.
 - **CLI binary:** `rod` → `beam`
 - **Keygen binary:** `beam-sea-keygen` (already named for BEAM)
 - **License header:** Dual copyright — `Copyright (c) 2021 Martti Malmi`,
-  `Copyright (c) 2026 David Newman <david.r.newman@proton.me>`
+  `Copyright (c) 2026 David Newman <david@retiform.dev>`
 
 #### Preserved
 

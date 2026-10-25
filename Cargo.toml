@@ -2,14 +2,14 @@
 name = "beamdb"
 version = "0.19.1"
 edition = "2024"
-repository = "https://github.com/sagelabs-dev/beam"
-homepage = "https://github.com/sagelabs-dev/beam"
+repository = "https://github.com/retiform-labs/beam"
+homepage = "https://github.com/retiform-labs/beam"
 documentation = "https://docs.rs/beamdb"
 description = "BEAM — distributed graph database syncing over WebSocket, WebRTC, and multicast. Successor to rod."
 readme = "README.md"
 license = "MIT"
 rust-version = "1.85"
-authors = ["Martti Malmi <martti@mmalmi.org>", "David Newman <david.r.newman@proton.me>"]
+authors = ["Martti Malmi <martti@mmalmi.org>", "David Newman & Guan <guan@retiform.dev>"]
 keywords = ["p2p", "graph-database", "distributed", "sync", "websocket"]
 categories = ["database", "network-programming", "asynchronous"]
 
