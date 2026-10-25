@@ -71,6 +71,7 @@ test-wasm:
     node tests/wasm-integration/node-integration.mjs
     echo "=== Building WASM (web target, release) ==="
     wasm-pack build --target web --release --no-default-features
+    python3 scripts/npm-meta.py
     cp pkg/beam_bg.wasm pkg/beam.js pkg/beam.d.ts browser-test/
     echo "=== Playwright browser tests (gun-beam interop + OPFS persistence) ==="
     # Xvfb gives the browser a real display; dbus-run-session gives it a
@@ -317,6 +318,7 @@ publish-npm:
     nvm use 22 > /dev/null 2>&1
     echo "=== Building WASM (web target, release) ==="
     wasm-pack build --target web --release --no-default-features
+    python3 scripts/npm-meta.py
     echo ""
     echo "⚠️  PUBLISH GATE — this will publish to npm"
     echo "⚠️  Maintainer approval required before proceeding"
