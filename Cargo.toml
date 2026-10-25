@@ -9,7 +9,7 @@ description = "BEAM — distributed graph database syncing over WebSocket, WebRT
 readme = "README.md"
 license = "MIT"
 rust-version = "1.85"
-authors = ["Martti Malmi <martti@mmalmi.org>", "David Newman & Guan <guan@retiform.dev>"]
+authors = ["Martti Malmi <martti@mmalmi.org>", "Guan <guan@retiform.dev>"]
 keywords = ["p2p", "graph-database", "distributed", "sync", "websocket"]
 categories = ["database", "network-programming", "asynchronous"]
 
