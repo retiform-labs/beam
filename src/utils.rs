@@ -227,6 +227,48 @@ pub(crate) fn try_send_or_log(
     }
 }
 
+// ------------------------------------------------ State clock (Gun State())
+
+/// Divisor Gun.js uses to sub-divide a millisecond when the wall clock has
+/// not advanced (D = 999 in src/state.js).
+const STATE_SUBDIVISIONS: f64 = 999.0;
+
+struct StateClock {
+    last: f64,
+    n: u64,
+}
+
+/// Process-wide monotonic state clock - the Rust counterpart of Gun.js State().
+static STATE_CLOCK: parking_lot::Mutex<StateClock> = parking_lot::Mutex::new(StateClock { last: 0.0, n: 0 });
+
+/// Returns a strictly increasing Gun.js state (timestamp) in milliseconds.
+///
+/// Gun.js never emits two equal states from one process: when the wall clock
+/// has not advanced, State() returns t + (n += 1) / 999, so successive calls
+/// inside the same millisecond still order. BEAM previously used raw
+/// SystemTime::as_millis(), which can repeat - and because a Put stamps its
+/// leaf and every ancestor from a single value, two writes inside one
+/// millisecond produced identical timestamps, which HAM then judged stale.
+///
+/// This is protocol-relevant, not cosmetic: HAM equality branch
+/// (state === was) is only reachable across peers, never for two local
+/// writes, once the clock is monotonic.
+pub fn next_state() -> f64 {
+    let mut clock = STATE_CLOCK.lock();
+    let now = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as f64;
+    if clock.last < now {
+        clock.n = 0;
+        clock.last = now;
+    } else {
+        clock.n += 1;
+        clock.last = now + clock.n as f64 / STATE_SUBDIVISIONS;
+    }
+    clock.last
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

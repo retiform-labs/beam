@@ -52,7 +52,7 @@ fn write_json_str(buf: &mut Vec<u8>, s: &str) {
 /// - `Number(n)` → f64 via `serde_json::to_writer` (ryu formatter)
 /// - `Text(s)` → JSON string
 /// - `Link(soul)` → `{"#":"soul"}`
-fn write_json_value(buf: &mut Vec<u8>, value: &Value) {
+pub(crate) fn write_json_value(buf: &mut Vec<u8>, value: &Value) {
     match value {
         Value::Null => buf.extend_from_slice(b"null"),
         Value::Bit(true) => buf.extend_from_slice(b"true"),
@@ -68,6 +68,20 @@ fn write_json_value(buf: &mut Vec<u8>, value: &Value) {
             buf.push(b'}');
         }
     }
+}
+
+/// Compares two Values exactly as Gun.js HAM does.
+///
+/// Gun.js resolves an equal-timestamp conflict with L(val) <= L(known), where
+/// L is JSON.stringify - a lexicographic comparison of the two values
+/// serialized form, NOT incumbent-wins. This reproduces it with the same wire
+/// encoder BEAM uses for relay, so the tie-break cannot drift from what peers
+/// see. Less or Equal => the incoming value loses (drop it).
+pub(crate) fn gun_wire_json_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    let (mut ba, mut bb) = (Vec::new(), Vec::new());
+    write_json_value(&mut ba, a);
+    write_json_value(&mut bb, b);
+    ba.cmp(&bb)
 }
 
 #[derive(Clone, Debug)]

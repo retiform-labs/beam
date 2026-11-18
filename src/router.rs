@@ -292,7 +292,7 @@ pub struct Router {
     /// When full, the oldest soul entry is evicted along with all
     /// its key timestamps — acceptable because stale-data detection
     /// only needs recent entries.
-    ham_cache: BoundedHashMap<String, FxHashMap<String, f64>>,
+    ham_cache: BoundedHashMap<String, FxHashMap<String, (f64, Value)>>,
 }
 
 #[async_trait]
@@ -796,9 +796,18 @@ impl Router {
                 // Mirrors Gun.js's per-key `ham()` inside its `while` loop.
                 let effective_put: Put;
                 let put_ref: &Put = match self.ham_filter(put) {
-                    HamFilterResult::Stale => {
+                      HamFilterResult::Stale => {
                         self.metrics.record_dropped_ham();
                         debug!("ham: dropped stale put {}", put.id);
+                        // A HAM drop is a legitimate verdict, but it must still
+                        // ACK: the originating caller is blocked on a oneshot in
+                        // pending_puts keyed by put.id, and returning here without
+                        // a reply hangs it for the full 30s ceiling before it
+                        // fails with a spurious "put timed out". Gun.js resolves
+                        // the local write callback for a dropped put too (ham()
+                        // returns early, then fire(ctx) still runs) - liveness is
+                        // independent of what HAM decides.
+                        self.send_ham_stale_ack(put);
                         return;
                     }
                     HamFilterResult::New => put,
@@ -1303,6 +1312,32 @@ impl Router {
         debug!("forwarded flush to {} storage write adapters", sent.len());
     }
 
+    /// Acknowledges a Put that HAM dropped as stale.
+    ///
+    /// Mirrors the shape storage adapters emit on a successful commit
+    /// (sentinel::ACK node carrying an _ack child), so the originator Node
+    /// existing ack drain in Node::handle_put resolves it without any new
+    /// plumbing or a second decoder.
+    ///
+    /// The verdict being "stale" does not make the write a failure: the
+    /// data the peer sent is simply not newer than what we already hold.
+    /// Resolving the caller oneshot is a liveness requirement, not a
+    /// durability claim.
+    fn send_ham_stale_ack(&self, put: &Put) {
+        let mut ack_children: Children = BTreeMap::default();
+        ack_children.insert(
+            crate::sentinel::ACK.to_string(),
+            NodeData {
+                value: Value::Text("ok".to_string()),
+                updated_at: 0.0,
+            },
+        );
+        let mut nodes: BTreeMap<String, Children> = BTreeMap::default();
+        nodes.insert(crate::sentinel::ACK.to_string(), ack_children);
+        let ack = Put::new(nodes, Some(put.id.clone()), put.from.clone());
+        try_send_or_log(&put.from, Message::Put(ack), &self.metrics, "router:ham-stale-ack");
+    }
+
     /// HAM (Hypothetical Amnesia Machine) stale-data pre-filter.
     ///
     /// Compares each `(soul, key)` pair in `put` against the router's
@@ -1312,16 +1347,31 @@ impl Router {
     /// network relay. If any pair is newer (or unseen), updates the
     /// index for all pairs and returns `true`.
     ///
-    /// This mirrors Gun.js's `ham()` function (`src/root.js` line 120):
+    /// This mirrors Gun.js ham() (src/root.js lines 120-141, verified
+    /// against gun-js at ed27b48 / v0.2020.1239):
     ///
-    /// - `state < was` → old, skip *(our `updated_at < cached_at`)*
-    /// - `state === was && val === known` → same, skip *(our
-    ///   `updated_at == cached_at` — existing wins the tie)*
-    /// - otherwise → new, proceed
+    /// - state < was                                             -> old, skip
+    /// - state === was && (val === known || L(val) <= L(known))  -> same, skip
+    /// - otherwise                                               -> new, proceed
     ///
-    /// BEAM simplifies to `updated_at <= cached_at → skip`. Same-timestamp
-    /// conflicts resolve to "existing wins" (last-write-wins with the
-    /// incumbent keeping the tie), matching Gun.js's primary path.
+    /// L is JSON.stringify, so the equal-state tie-break is a LEXICOGRAPHIC
+    /// comparison of the two values serialized JSON -- not incumbent-wins.
+    /// That distinction is load-bearing: an incumbent keeping every tie
+    /// would make a tombstone unable to overwrite a live record at the same
+    /// state, and two peers writing inside one millisecond would never
+    /// converge.
+    ///
+    /// WARNING: the tie-break is ASCII-ordering-derived and therefore
+    /// TYPE-DEPENDENT. JSON.stringify(null) is the bare four characters
+    /// null (first codepoint 110), which outranks a quoted string (34), a
+    /// number, and an array -- so a tombstone WINS against those at equal
+    /// state. It LOSES against an object (open-brace = 123) and a boolean
+    /// (t = 116). Do not read this as tombstones always win.
+    ///
+    /// DIVERGENCE RETAINED: Gun gates the equal-state branch on !ctx.faith
+    /// and its drop on !ctx.miss. BEAM has no equivalent gates, so the
+    /// deterministic comparison always applies. Not built -- those are
+    /// opt-in traffic modes with no caller in this crate.
     ///
     /// # Performance
     ///
@@ -1339,7 +1389,8 @@ impl Router {
     /// - Future timestamps → accepted (not deferred — the router is
     ///   synchronous; Gun.js defers via `setTimeout`, which is a
     ///   timing optimization, not a correctness requirement).
-    /// - Same timestamp, different value → stale (existing wins).
+    /// - Same timestamp, higher-ordering value → new, proceeds (Gun parity).
+    /// - Same timestamp, lower-or-equal value → stale (dropped).
     ///
     /// # Per-Key Filtering
     ///
@@ -1365,11 +1416,31 @@ impl Router {
             let mut filtered_children = Children::default();
             for (key, node_data) in children {
                 // Check if this (soul, key) is stale.
-                let is_stale = self
-                    .ham_cache
-                    .get(soul)
-                    .and_then(|inner| inner.get(key))
-                    .is_some_and(|&cached_at| node_data.updated_at <= cached_at);
+                // Restore Gun.js ham() (src/root.js:132-135):
+                //
+                //   state <  was                            -> old,  drop
+                //   state == was && JSON.stringify(val)
+                //                   <= JSON.stringify(known) -> same, drop
+                //   otherwise                                -> new,  proceed
+                //
+                // The equal-timestamp case is a LEXICOGRAPHIC value compare,
+                // not incumbent-wins. An incumbent keeping every tie would make
+                // a tombstone (null) unable to overwrite a live record at the
+                // same state, and two peers writing in the same millisecond
+                // would never converge.
+                let cached = self.ham_cache.get(soul).and_then(|inner| inner.get(key));
+
+                let is_stale = match cached {
+                    None => false,
+                    Some((cached_at, cached_val)) => {
+                        node_data.updated_at < *cached_at
+                            || (node_data.updated_at == *cached_at
+                                && crate::message::gun_wire_json_cmp(
+                                    &node_data.value,
+                                    cached_val,
+                                ) != std::cmp::Ordering::Greater)
+                    }
+                };
 
                 if is_stale {
                     has_stale = true;
@@ -1385,7 +1456,7 @@ impl Router {
                     self.ham_cache.insert(soul.clone(), FxHashMap::default());
                 }
                 if let Some(inner) = self.ham_cache.get_mut(soul) {
-                    inner.insert(key.clone(), node_data.updated_at);
+                    inner.insert(key.clone(), (node_data.updated_at, node_data.value.clone()));
                 }
             }
             if !filtered_children.is_empty() {
@@ -1760,6 +1831,155 @@ mod tests {
         );
     }
 
+
+    // ========================================================================
+    // Falsifiers for the HAM stale-put defect (2026-11-18)
+    // ========================================================================
+
+    /// FALSIFIER 1 - equal state, DIFFERENT value: the tie-break is the value.
+    ///
+    /// FIXED design:    lower value -> Stale, higher value -> New
+    /// REVERTED design: BOTH -> Stale (timestamp-only <=, incumbent wins)
+    ///
+    /// The final assertion is the discriminator: under the old rule ANY
+    /// equal-state put was dropped; under the Gun rule a higher-ordering
+    /// value wins the tie.
+    #[test]
+    fn ham_equal_state_value_tiebreak() {
+        let metrics = Arc::new(Metrics::new());
+        let mut router = Router::new(vec![], vec![], metrics);
+
+        // Cache the lexicographically high value.
+        let put1 = make_put("soul1", "key1", "zzz", 150.0);
+        assert!(matches!(router.ham_filter(&put1), HamFilterResult::New));
+
+        // Same state, LOWER value -> Gun drops it (val <= known).
+        let put2 = make_put("soul1", "key1", "aaa", 150.0);
+        assert!(
+            matches!(router.ham_filter(&put2), HamFilterResult::Stale),
+            "lower-ordering value must lose the tie"
+        );
+
+        // Fresh router: cache the low value then offer the high one.
+        let mut r2 = Router::new(vec![], vec![], Arc::new(Metrics::new()));
+        assert!(matches!(
+            r2.ham_filter(&make_put("s2", "k", "aaa", 150.0)),
+            HamFilterResult::New
+        ));
+        assert!(
+            matches!(
+                r2.ham_filter(&make_put("s2", "k", "zzz", 150.0)),
+                HamFilterResult::New
+            ),
+            "higher-ordering value must WIN the tie (this is the fix)"
+        );
+    }
+
+    /// FALSIFIER 2 - tombstone at the same state as a live record.
+    ///
+    /// FIXED design:    New   (null serializes to bare null, which sorts
+    ///                         above a quoted string)
+    /// REVERTED design: Stale (timestamp-only <=)
+    ///
+    /// This is the delete-then-read shape behind test_delete_tombstone.
+    #[test]
+    fn ham_equal_state_tombstone_proceeds() {
+        let metrics = Arc::new(Metrics::new());
+        let mut router = Router::new(vec![], vec![], metrics);
+
+        let live = make_put("soul1", "key1", "ghost", 100.0);
+        assert!(matches!(router.ham_filter(&live), HamFilterResult::New));
+
+        let mut children: Children = BTreeMap::default();
+        children.insert(
+            "key1".to_string(),
+            NodeData { value: Value::Null, updated_at: 100.0 },
+        );
+        let mut nodes = BTreeMap::default();
+        nodes.insert("soul1".to_string(), children);
+        let tomb = Put::new(nodes, None, Addr::noop());
+
+        assert!(
+            matches!(router.ham_filter(&tomb), HamFilterResult::New),
+            "a tombstone at the same state must not be discarded"
+        );
+    }
+
+    /// FALSIFIER 2b - the equal-state tie-break is TYPE-DEPENDENT, both ways.
+    ///
+    /// Gun compares JSON.stringify(val) <= JSON.stringify(known) as raw bytes.
+    /// So at equal state a tombstone (serializes to bare , first
+    /// codepoint 110) BEATS a string (34), a number, and an array -- but
+    /// LOSES to an object (open-brace 123) and a boolean ( 116).
+    ///
+    /// Both directions are asserted deliberately: a future reader must not
+    /// infer "tombstones always win" from falsifier 2 alone.
+    #[test]
+    fn ham_equal_state_tiebreak_is_type_dependent() {
+        // ── Tombstone WINS against a string at equal state ──
+        let metrics = Arc::new(Metrics::new());
+        let mut r = Router::new(vec![], vec![], metrics);
+        assert!(matches!(
+            r.ham_filter(&make_put("s", "k", "live", 200.0)),
+            HamFilterResult::New
+        ));
+        let mut c: Children = BTreeMap::default();
+        c.insert("k".to_string(), NodeData { value: Value::Null, updated_at: 200.0 });
+        let mut n = BTreeMap::default();
+        n.insert("s".to_string(), c);
+        assert!(
+            matches!(r.ham_filter(&Put::new(n, None, Addr::noop())), HamFilterResult::New),
+            "null (110) must beat a quoted string (34) at equal state"
+        );
+
+        // ── Tombstone LOSES against an object at equal state ──
+        // Object serializes starting with '{' (123), which outranks null (110).
+        let metrics2 = Arc::new(Metrics::new());
+        let mut r2 = Router::new(vec![], vec![], metrics2);
+        let mut c2: Children = BTreeMap::default();
+        c2.insert("k".to_string(), NodeData { value: Value::Null, updated_at: 300.0 });
+        let mut n2 = BTreeMap::default();
+        n2.insert("s".to_string(), c2);
+        assert!(
+            matches!(r2.ham_filter(&Put::new(n2, None, Addr::noop())), HamFilterResult::New),
+            "null must land first so it becomes the incumbent"
+        );
+        // Now offer a Link at the same state -- a Link serializes as {"#":...},
+        // which is an object and therefore sorts above null.
+        let mut c3: Children = BTreeMap::default();
+        c3.insert(
+            "k".to_string(),
+            NodeData { value: Value::Link("target".to_string()), updated_at: 300.0 },
+        );
+        let mut n3 = BTreeMap::default();
+        n3.insert("s".to_string(), c3);
+        assert!(
+            matches!(r2.ham_filter(&Put::new(n3, None, Addr::noop())), HamFilterResult::New),
+            "an object payload (123) must beat the null incumbent (110) at equal state"
+        );
+    }
+
+    /// FALSIFIER 3 - the state clock is strictly monotonic (Gun State parity).
+    ///
+    /// FIXED design:    0 violations across 5000 calls
+    /// REVERTED design: at least 1 violation (raw as_millis repeats in 1 ms)
+    ///
+    /// Root cause: a repeated state forces HAM to arbitrate a tie that Gun
+    /// clock guarantees can never occur between two local writes.
+    #[test]
+    fn next_state_is_strictly_monotonic() {
+        let mut prev = crate::utils::next_state();
+        let mut violations = 0;
+        for _ in 0..5000 {
+            let cur = crate::utils::next_state();
+            if cur <= prev {
+                violations += 1;
+            }
+            prev = cur;
+        }
+        assert_eq!(violations, 0, "state clock must be strictly increasing");
+    }
+
     // ========================================================================
     // HAM Pre-Filter Tests (Tier 0)
     // ========================================================================
@@ -1823,7 +2043,7 @@ mod tests {
             .ham_cache
             .get(&"soul1".to_string())
             .and_then(|m| m.get(&"key1".to_string()));
-        assert_eq!(cached, Some(&200.0));
+        assert_eq!(cached.map(|(t, _)| *t), Some(200.0));
     }
 
     #[test]
@@ -1841,7 +2061,7 @@ mod tests {
     }
 
     #[test]
-    fn ham_filter_same_timestamp_returns_stale() {
+    fn ham_filter_same_timestamp_equal_value_returns_stale() {
         // Same timestamp = existing wins the tie.
         let metrics = Arc::new(Metrics::new());
         let mut router = Router::new(vec![], vec![], metrics);
@@ -1850,7 +2070,7 @@ mod tests {
         assert!(matches!(router.ham_filter(&put1), HamFilterResult::New));
 
         // Same ts, different value → stale (existing wins).
-        let put2 = make_put("soul1", "key1", "v2", 150.0);
+        let put2 = make_put("soul1", "key1", "v1", 150.0);
         assert!(matches!(router.ham_filter(&put2), HamFilterResult::Stale));
     }
 
@@ -1886,7 +2106,7 @@ mod tests {
             .ham_cache
             .get(&"soul1".to_string())
             .and_then(|m| m.get(&"key2".to_string()));
-        assert_eq!(cached_k2, Some(&200.0));
+        assert_eq!(cached_k2.map(|(t, _)| *t), Some(200.0));
     }
 
     #[test]
@@ -2137,4 +2357,88 @@ mod tests {
             4
         );
     }
+    /// FALSIFIER 4 - ACK INVARIANT: a HAM-dropped put must still be acked.
+    ///
+    /// FIXED design:    the router queues an ack Put whose in_response_to is
+    ///                  the dropped put id; try_recv yields it and we pass.
+    /// REVERTED design: the router returns at the Stale early-exit having sent
+    ///                  nothing; the queue drains empty and we fail. That is
+    ///                  the 30s caller block, observed at test scale.
+    ///
+    /// Determinism: MailboxSender::send is a synchronous push, and
+    /// Router::handle is awaited to completion, so the ack is already in the
+    /// queue before the first try_recv. No sleeps, no deadline, no polling -
+    /// so this cannot flake under parallel test load.
+    #[tokio::test]
+    async fn ham_stale_put_still_acks() {
+        let metrics = Arc::new(Metrics::new());
+        let mut router = Router::new(vec![], vec![], metrics.clone());
+
+        let (tx, mut rx) = crate::mailbox::mailbox(64);
+        let origin = Addr::new(tx.clone());
+        router.known_peers.insert(origin.clone());
+
+        // 1. Fresh put - populates the HAM cache.
+        let mut c1: Children = BTreeMap::default();
+        c1.insert(
+            "k".to_string(),
+            NodeData { value: Value::Text("v2".to_string()), updated_at: 500.0 },
+        );
+        let mut n1 = BTreeMap::default();
+        n1.insert("soul".to_string(), c1);
+        router
+            .handle(
+                Arc::new(Message::Put(Put::new(n1, None, origin.clone()))),
+                &test_ctx(),
+            )
+            .await;
+
+        // 2. Stale put - older state, same path. HAM must drop it AND ack it.
+        let mut c2: Children = BTreeMap::default();
+        c2.insert(
+            "k".to_string(),
+            NodeData { value: Value::Text("v1".to_string()), updated_at: 100.0 },
+        );
+        let mut n2 = BTreeMap::default();
+        n2.insert("soul".to_string(), c2);
+        let stale = Put::new(n2, None, origin.clone());
+        let stale_id = stale.id.clone();
+        router
+            .handle(Arc::new(Message::Put(stale)), &test_ctx())
+            .await;
+
+        assert_eq!(
+            router.metrics().snapshot().messages_dropped_ham,
+            1,
+            "the put must be judged stale, or this test is not on the ack path"
+        );
+
+        // The ack (if any) was queued synchronously during handle().await -
+        // drain the mailbox and look for it.
+        let mut acks: Vec<String> = Vec::new();
+        let mut all: Vec<String> = Vec::new();
+        while let Some(msg) = rx.try_recv() {
+            match &*msg {
+                Message::Put(p) => {
+                    all.push(format!("Put(irt={:?})", p.in_response_to));
+                    if let Some(id) = &p.in_response_to {
+                        acks.push(id.clone());
+                    }
+                }
+                _ => all.push("non-put".to_string()),
+            }
+        }
+        let snap = router.metrics().snapshot();
+
+        assert!(
+            acks.iter().any(|a| a == &stale_id),
+            "a HAM-dropped put must still be acked; got {:?}; all={:?};              dropped_ham={} dropped_send={} stale_id={}",
+            acks,
+            all,
+            snap.messages_dropped_ham,
+            snap.dropped_sends,
+            stale_id
+        );
+    }
+
 }

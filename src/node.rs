@@ -52,7 +52,7 @@ use tokio::sync::watch;
 use tokio::sync::{broadcast, oneshot};
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_websockets::ClientBuilder;
-use web_time::{Duration, SystemTime};
+use web_time::Duration;
 
 /// Default wait for [`Node::once`] when no explicit timeout is given.
 ///
@@ -976,10 +976,10 @@ impl Node {
         value: Value,
         policy: AckPolicy,
     ) -> Result<ReplicationStatus, String> {
-        let updated_at: f64 = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as f64;
+        // Gun State(): strictly monotonic, so two local writes inside the
+        // same millisecond cannot collide on an equal state and force HAM
+        // to arbitrate a tie the protocol clock guarantees cannot occur.
+        let updated_at: f64 = crate::utils::next_state();
         debug!("put_quorum (required: {} peers)", policy.quorum);
         if let Some(sender) = self.inner.on_sender.read().as_ref() {
             sender.send(value.clone()).ok();
@@ -1037,10 +1037,10 @@ impl Node {
     }
 
     pub async fn put(&mut self, value: Value) -> Result<(), String> {
-        let updated_at: f64 = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as f64;
+        // Gun State(): strictly monotonic, so two local writes inside the
+        // same millisecond cannot collide on an equal state and force HAM
+        // to arbitrate a tie the protocol clock guarantees cannot occur.
+        let updated_at: f64 = crate::utils::next_state();
         if let Some(sender) = self.inner.on_sender.read().as_ref() {
             sender.send(value.clone()).ok();
         }
@@ -1113,10 +1113,10 @@ impl Node {
     ///
     /// * `ops` - Vector of `(path, value)` pairs
     pub async fn batch_put(&mut self, ops: Vec<(Vec<String>, Value)>) -> Result<(), String> {
-        let updated_at: f64 = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as f64;
+        // Gun State(): strictly monotonic, so two local writes inside the
+        // same millisecond cannot collide on an equal state and force HAM
+        // to arbitrate a tie the protocol clock guarantees cannot occur.
+        let updated_at: f64 = crate::utils::next_state();
 
         let mut puts = Vec::with_capacity(ops.len());
         for (path, value) in ops {
