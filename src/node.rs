@@ -825,6 +825,40 @@ impl Node {
         subscriber
     }
 
+    /// Builds the `(uid, children)` record holding a node's **own** value.
+    ///
+    /// Gun.js encodes a node's own value as a child entry under the
+    /// reserved `_` key, so `map()` on that node replays the value as a
+    /// synthetic child - this is what Gun.js semantics expect for a node's
+    /// own value as distinct from its children.
+    ///
+    /// Both `Node::put` and `Node::batch_put` must write this record.
+    /// Writing only the parent ladder (via `Node::add_parent_nodes`) makes the
+    /// value visible to *ancestors* while leaving it invisible to the node that
+    /// owns it.
+    ///
+    /// Factored out precisely so the two write paths cannot diverge again: for
+    /// the same `(uid, value, updated_at)`, `put` and `batch_put` now emit
+    /// byte-identical records.
+    ///
+    /// # Arguments
+    ///
+    /// * `uid` - the node's own soul (`""` for the root, `"a/b"` otherwise).
+    /// * `value` - the value to encode under `_`.
+    /// * `updated_at` - Unix epoch milliseconds, shared by every record in one
+    ///   Put so a batch carries a single coherent timestamp.
+    fn self_record(uid: &str, value: &Value, updated_at: f64) -> (String, Children) {
+        let mut children = Children::default();
+        children.insert(
+            "_".to_string(),
+            NodeData {
+                value: value.clone(),
+                updated_at,
+            },
+        );
+        (uid.to_string(), children)
+    }
+
     /// Walks up the parent chain, building the `updated_nodes` map for a Put.
     ///
     /// For each ancestor, this inserts the child's value as a child of the
@@ -1011,19 +1045,9 @@ impl Node {
         let mut updated_nodes = BTreeMap::default();
         // Store the value at self.inner.uid under the "_" convention (Gun.js
         // soul-value encoding) so that map() on self returns the value
-        // as a synthetic child. This is what Gun.js semantics expect for
-        // a node's own value vs its children. Previously put only wrote
-        // under parent_id via add_parent_nodes, so map() on the leaf
-        // never saw the put value.
-        let self_uid = self.inner.uid.read().clone();
-        let mut self_children = Children::default();
-        self_children.insert(
-            "_".to_string(),
-            NodeData {
-                value: value.clone(),
-                updated_at,
-            },
-        );
+        // as a synthetic child. See `Node::self_record`.
+        let (self_uid, self_children) =
+            Self::self_record(&self.inner.uid.read(), &value, updated_at);
         updated_nodes.insert(self_uid, self_children);
         // Continue with parent chain propagation using the raw value so
         // parents' child entries remain the actual value (this is what
@@ -1104,7 +1128,18 @@ impl Node {
                 let _ = sender.send(value.clone());
             }
 
+            // Mirror Node::put exactly: the leaf's own value goes under its
+            // own uid with the "_" convention, so `map()` on the leaf replays
+            // it. Without this, a batched write is visible to every ancestor
+            // but invisible to the node that owns the value.
             let mut updated_nodes = BTreeMap::default();
+            let (self_uid, self_children) =
+                Self::self_record(&leaf.inner.uid.read(), &value, updated_at);
+            updated_nodes.insert(self_uid, self_children);
+            // The parent ladder is still required - it is what makes
+            // ancestor `map()` and cross-node relay work. Order between the
+            // two is immaterial for storage (they touch disjoint souls), but
+            // it is kept identical to `put` so the two paths read alike.
             leaf.add_parent_nodes(&mut updated_nodes, value, updated_at);
 
             let my_addr = self.inner.addr.read().clone().unwrap();
