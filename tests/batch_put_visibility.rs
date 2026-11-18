@@ -5,6 +5,7 @@ use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::timeout;
 
+use beam::ack::AckPolicy;
 use beam::sentinel::REPLAY_COMPLETE;
 use beam::{Node, Value};
 
@@ -101,6 +102,27 @@ async fn suspect_batch_put_visible_on_leaf_map() {
     assert!(
         keys(&items).contains(&"_".to_string()),
         "batch_put: leaf map got {:?}",
+        keys(&items)
+    );
+}
+
+///  funnels through the same write path as  and
+/// , so it must persist the leaf's own  record too. It is
+/// covered separately because it builds its  by hand rather than
+/// going through either of the other two entry points.
+#[tokio::test]
+async fn quorum_put_visible_on_leaf_map() {
+    let mut db = Node::new();
+    db.get("qnode")
+        .put_quorum(Value::Text("hello".into()), AckPolicy::any())
+        .await
+        .unwrap();
+    let mut rx = db.get("qnode").map();
+    let items = drain(&mut rx).await;
+    db.stop();
+    assert!(
+        keys(&items).contains(&"_".to_string()),
+        "put_quorum: leaf map got {:?}",
         keys(&items)
     );
 }

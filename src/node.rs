@@ -985,6 +985,9 @@ impl Node {
             sender.send(value.clone()).ok();
         }
         let mut updated_nodes = BTreeMap::default();
+        let (self_uid, self_children) =
+            Self::self_record(&self.inner.uid.read(), &value, updated_at);
+        updated_nodes.insert(self_uid, self_children);
         self.add_parent_nodes(&mut updated_nodes, value, updated_at);
         let my_addr = self.inner.addr.read().clone().unwrap();
         let put = Put::new(updated_nodes, None, my_addr.clone());
